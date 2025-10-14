@@ -336,315 +336,325 @@
 
     <!-- JavaScript for interactivity and theme switching -->
     <script>
-        // --- Theme Toggle Logic ---
-        const htmlEl = document.documentElement;
-        const themeToggle = document.getElementById('themeToggle');
-        const themeIcon = document.getElementById('themeIcon');
-        const storageKey = 'theme-preference';
+        #!/usr/bin/env python3
+"""
+app.py - Flask frontend + API for the async port scanner.
 
-        // Function to set theme
-        function setTheme(theme) {
-            if (theme === 'dark') {
-                htmlEl.classList.add('dark');
-                localStorage.setItem(storageKey, 'dark');
-                themeIcon.classList.replace('fa-sun', 'fa-moon');
-            } else {
-                htmlEl.classList.remove('dark');
-                localStorage.setItem(storageKey, 'light');
-                themeIcon.classList.replace('fa-moon', 'fa-sun');
-            }
+Requirements:
+  - Flask
+  - your scanner module (port_scanner.py) in the same repo
+
+Deploy notes:
+  - On Render, use a single gunicorn worker (or implement external job persistence)
+    Start command example:
+      gunicorn app:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
+"""
+
+import os
+import time
+import uuid
+import logging
+import subprocess
+from typing import Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, Future
+
+from flask import Flask, render_template, request, jsonify, Response
+
+# -------------------------
+# Try to import scanner helpers (be resilient if parse_nmap_aggressive is missing)
+# -------------------------
+try:
+    # your scanner module (the file you posted; ensure it's named port_scanner.py)
+    from port_scanner import (
+        run_scan_sync,
+        analyze_results,
+        format_scan_results,
+        run_nmap_service_scan,
+        parse_nmap_aggressive,
+    )
+except Exception as e:
+    # If parse_nmap_aggressive isn't present, import what we can and create a stub parser
+    logging.warning("port_scanner import incomplete: %s", e)
+    try:
+        from port_scanner import run_scan_sync, analyze_results, format_scan_results, run_nmap_service_scan
+    except Exception as inner:
+        # If even basic functions are missing, raise so the app won't start silently broken.
+        raise
+
+    def parse_nmap_aggressive(nmap_out: str) -> dict:
+        """Fallback parser - minimal structure so app doesn't crash."""
+        return {"ports": [], "host_up": None, "os_text": None, "service_info": None, "traceroute": []}
+
+
+# -------------------------
+# Flask app setup
+# -------------------------
+app = Flask(__name__, static_folder="static", template_folder="templates")
+logging.basicConfig(level=logging.INFO)
+
+# In-memory job store and executor (simple, not shared across processes)
+jobs: Dict[str, Dict[str, Any]] = {}
+executor = ThreadPoolExecutor(max_workers=4)
+
+# Limits (same as your scanner)
+MAX_PORT_RANGE = 2000
+MAX_CONCURRENCY = 2000
+
+INSECURE_NOTES = {
+    "telnet": "Telnet is insecure (plaintext).",
+    "ftp": "FTP transmits credentials in cleartext.",
+}
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def validate_params(target: str, start: int, end: int, concurrency: int):
+    if not target:
+        raise ValueError("target required")
+    if start < 1 or end > 65535 or start > end:
+        raise ValueError("invalid port range")
+    if (end - start + 1) > MAX_PORT_RANGE:
+        raise ValueError(f"port range too large (limit {MAX_PORT_RANGE})")
+    if concurrency < 1 or concurrency > MAX_CONCURRENCY:
+        raise ValueError("invalid concurrency")
+
+
+def run_scan_task(target: str, start: int, end: int, concurrency: int,
+                  connect_timeout: float, read_timeout: float, rate_delay: float, jitter: float,
+                  no_banner: bool, use_nmap: bool = False, aggressive: bool = False) -> dict:
+    """
+    Execute the scanning pipeline:
+      - run async scanner via run_scan_sync
+      - analyze results
+      - optionally run/parse nmap and merge
+      - produce _formatted text for UI
+    """
+    try:
+        # run the scanner (this should return tuple (ip, raw_results) based on your scanner)
+        ip, raw = run_scan_sync(target, start, end, concurrency,
+                                connect_timeout, (0.01 if no_banner else read_timeout),
+                                rate_delay, jitter)
+
+        enriched = analyze_results(raw)
+
+        result_obj = {
+            "status": "done",
+            "target": target,
+            "resolved_ip": ip,
+            "start": start,
+            "end": end,
+            "results": enriched,
+            "scanned_at": time.time()
         }
 
-        // Initialize theme based on storage or system preference
-        function initializeTheme() {
-            let preferredTheme = localStorage.getItem(storageKey);
-            
-            // If no preference stored, check system default (prefers-color-scheme: dark)
-            if (!preferredTheme) {
-                preferredTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-            }
-            
-            setTheme(preferredTheme);
-        }
+        # Optionally run nmap and parse results
+        if use_nmap:
+            logging.info("Invoking nmap for %s ports=%s aggressive=%s", target, f"{start}-{end}", aggressive)
+            nmap_out = run_nmap_service_scan(target, ports=f"{start}-{end}", aggressive=aggressive)
+            if nmap_out:
+                nmap_info = parse_nmap_aggressive(nmap_out)
+                result_obj["_nmap"] = nmap_info
+
+                # merge nmap ports into enriched if not already present
+                nm_by_port = {p["port"]: p for p in nmap_info.get("ports", [])}
+                ports_seen = {r["port"] for r in enriched}
+                for port, nm in nm_by_port.items():
+                    if port not in ports_seen:
+                        enriched.append({
+                            "port": port,
+                            "state": nm.get("state", "unknown"),
+                            "service_hint": None,
+                            "detected_service": nm.get("service"),
+                            "version": nm.get("version"),
+                            "banner": None,
+                            "insecure_note": INSECURE_NOTES.get(nm.get("service")) if nm.get("service") else None,
+                            "rtt_ms": 0.0,
+                        })
+                enriched.sort(key=lambda x: x["port"])
+                result_obj["results"] = enriched
+
+        # Format for UI (best-effort)
+        try:
+            result_obj["_formatted"] = format_scan_results(result_obj)
+        except Exception:
+            logging.exception("format_scan_results failed")
+
+        return result_obj
+
+    except Exception as e:
+        logging.exception("run_scan_task failed for %s", target)
+        return {"status": "error", "error": str(e)}
+
+
+def create_scan_job(target: str, start: int, end: int, concurrency: int,
+                    connect_timeout: float, read_timeout: float, rate_delay: float, jitter: float,
+                    no_banner: bool, use_nmap: bool = False, aggressive: bool = False) -> Tuple[str, dict]:
+    job_id = str(uuid.uuid4())
+    created = time.time()
+
+    def worker():
+        return run_scan_task(target, start, end, concurrency,
+                             connect_timeout, read_timeout, rate_delay, jitter,
+                             no_banner, use_nmap=use_nmap, aggressive=aggressive)
+
+    future = executor.submit(worker)
+    jobs[job_id] = {"future": future, "created": created, "params": {"target": target, "start": start, "end": end, "use_nmap": use_nmap, "aggressive": aggressive}}
+    return job_id, jobs[job_id]
+
+
+# -------------------------
+# Routes
+# -------------------------
+@app.route("/")
+def index():
+    # Serve templates/index.html — ensure file exists in templates/
+    return render_template("index.html")
+
+
+@app.route("/scan-blocking", methods=["POST"])
+def scan_blocking():
+    """
+    Blocking endpoint that runs the scan synchronously and returns text output.
+    Accepts either 'target' or 'host' field.
+    """
+    data = request.get_json() or request.form
+    try:
+        target = data.get("target") or data.get("host")
+        if not target:
+            raise ValueError("target (or host) required")
+
+        start = int(data.get("start", 1))
+        end = int(data.get("end", 1024))
+        concurrency = int(data.get("concurrency", 200))
+        connect_timeout = float(data.get("connect_timeout", 3.0))
+        read_timeout = float(data.get("read_timeout", 2.0))
+        rate_delay = float(data.get("rate_delay", 0.0))
+        jitter = float(data.get("jitter", 0.02))
+        no_banner = bool(data.get("no_banner", False))
+        use_nmap = bool(data.get("use_nmap", False))
+        aggressive = bool(data.get("aggressive", False))
+
+        validate_params(target, start, end, concurrency)
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+
+    try:
+        result_obj = run_scan_task(target, start, end, concurrency,
+                                   connect_timeout, read_timeout, rate_delay, jitter,
+                                   no_banner, use_nmap=use_nmap, aggressive=aggressive)
+        formatted = result_obj.get("_formatted") or format_scan_results(result_obj)
+        return Response(formatted, mimetype="text/plain")
+    except Exception as e:
+        logging.exception("scan_blocking failed")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/scan", methods=["POST"])
+def scan():
+    """
+    Non-blocking: create background job and return job_id.
+    Accepts JSON/form with 'target' or 'host'.
+    """
+    data = request.get_json() or request.form
+    try:
+        target = data.get("target") or data.get("host")
+        if not target:
+            return jsonify({"status": "error", "error": "target (or host) parameter required"}), 400
+
+        start = int(data.get("start", 1))
+        end = int(data.get("end", 1024))
+        concurrency = int(data.get("concurrency", 200))
+        connect_timeout = float(data.get("connect_timeout", 3.0))
+        read_timeout = float(data.get("read_timeout", 2.0))
+        rate_delay = float(data.get("rate_delay", 0.0))
+        jitter = float(data.get("jitter", 0.02))
+        no_banner = bool(data.get("no_banner", False))
+        use_nmap = bool(data.get("use_nmap", False))
+        aggressive = bool(data.get("aggressive", False))
+
+        validate_params(target, start, end, concurrency)
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+
+    job_id, job_meta = create_scan_job(target, start, end, concurrency,
+                                       connect_timeout, read_timeout, rate_delay, jitter, no_banner,
+                                       use_nmap=use_nmap, aggressive=aggressive)
+    return jsonify({"status": "submitted", "job_id": job_id, "created": job_meta["created"], "params": job_meta["params"]})
+
+
+@app.route("/scan-status/<job_id>", methods=["GET"])
+def scan_status(job_id):
+    meta = jobs.get(job_id)
+    if not meta:
+        return jsonify({"status": "error", "error": "job not found"}), 404
+
+    future: Future = meta["future"]
+    want_text = request.args.get("format", "").lower() in ("txt", "text", "plain")
+    if future.done():
+        result = future.result()
+        if want_text:
+            formatted = result.get("_formatted") or format_scan_results(result)
+            return Response(formatted, mimetype="text/plain")
+        else:
+            return jsonify({"status": result.get("status", "done"), "result": result})
+    else:
+        return jsonify({"status": "running", "created": meta["created"], "params": meta["params"]})
+
+
+# -------------------------
+# Direct nmap subprocess endpoint (optional)
+# -------------------------
+@app.route("/nmap", methods=["POST"])
+def run_nmap_subprocess():
+    """
+    Runs the system nmap binary (if present).
+    Accepts JSON/form:
+      - target (or host)
+      - ports (default 1-65535)
+      - aggressive (bool) -> include -A
+      - timing (0-5)
+      - timeout (seconds)
+    Security: we build cmd list (no shell); still be careful exposing this in public.
+    """
+    data = request.get_json() or request.form
+    target = data.get("target") or data.get("host")
+    if not target:
+        return jsonify({"status": "error", "error": "target (or host) required"}), 400
+
+    ports = data.get("ports", "1-65535")
+    aggressive = bool(data.get("aggressive", False))
+    timing = str(int(data.get("timing", 4)))
+    timeout_sec = int(data.get("timeout", 300))
+
+    cmd = ["nmap", f"-T{timing}", "-p", ports]
+    if aggressive:
+        cmd.append("-A")
+    else:
+        cmd.append("-sV")
+    cmd.append(target)
+
+    logging.info("Running nmap: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        return jsonify({"status": "done" if proc.returncode == 0 else "error", "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr})
+    except subprocess.TimeoutExpired:
+        return jsonify({"status": "error", "error": "nmap timed out"}), 504
+    except FileNotFoundError:
+        return jsonify({"status": "error", "error": "nmap binary not found"}), 500
+    except Exception as e:
+        logging.exception("nmap subprocess failed")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+# -------------------------
+# Health
+# -------------------------
+@app.route("/status")
+def status():
+    return jsonify({"status": "ok", "time": time.time()})
         
-        // Handle toggle button click
-        if (themeToggle) {
-            themeToggle.addEventListener('click', () => {
-                const currentTheme = htmlEl.classList.contains('dark') ? 'light' : 'dark';
-                setTheme(currentTheme);
-            });
-        }
-
-        // Initialize the theme immediately
-        initializeTheme();
-
-        // --- Core Scanning Logic ---
-        
-        // Global state for API interaction
-        let currentMockScanData = '';
-        const API_BASE_URL = "/"; // Use relative path for Flask endpoints
-        
-        // DOM refs
-        const form = document.getElementById('scanForm');
-        const statusEl = document.getElementById('status');
-        const targetInput = document.getElementById('targetInput');
-        const mockResult = document.getElementById('mockResult');
-        
-        const tabDefault = document.getElementById('tabDefault');
-        const tabCustom = document.getElementById('tabCustom');
-        const customInputs = document.getElementById('customInputs');
-        const startPortEl = document.getElementById('startPort');
-        const endPortEl = document.getElementById('endPort');
-        const noBannerEl = document.getElementById('noBanner');
-
-        const DEFAULT_START = 1;
-        const DEFAULT_END = 1024;
-        let scanMode = "default";
-
-        // --- UI Helper Functions ---
-
-        function showLoading(targetValue) {
-            mockResult.innerHTML = `
-                <p class="text-primary-btn font-mono">Scanning <span id="mockTarget">${targetValue}</span>...</p>
-                <div class="loading-bar h-2 bg-border-light dark:bg-border-dark rounded-full mt-2 mb-4 overflow-hidden">
-                    <div class="loading-fill" id="loadingFill" style="width: 0%;"></div>
-                </div>
-            `;
-            mockResult.style.display = 'block';
-
-            const loadingFill = document.getElementById('loadingFill');
-            requestAnimationFrame(() => {
-                loadingFill.style.width = '100%';
-            });
-        }
-
-        function showResultsUI(targetValue, rawOutput) {
-            const hasOpenPorts = rawOutput.includes("OPEN:"); 
-            
-            let summaryMessage = "Scan Complete: Review the detailed output below.";
-            let summaryClass = "bg-primary-btn text-bg-light";
-            
-            if (hasOpenPorts) {
-                summaryMessage = "High Risk: Open ports detected. Review report and analyze!";
-                summaryClass = "bg-danger-alert text-bg-light";
-            }
-
-            // Clean up old analysis if it exists
-            const oldAnalysis = document.getElementById('aiAnalysisReportWrapper');
-            if (oldAnalysis) oldAnalysis.remove();
-
-            // The classes on the pre tag are now defined in the CSS to be black/green
-            mockResult.innerHTML = `
-                <p class="summary ${summaryClass} mb-4">${summaryMessage}</p>
-                <!-- Removed conflicting bg-gray-50 class, allowing custom CSS on pre tag to define background -->
-                <div id="scanOutput" class="text-sm rounded-lg overflow-x-auto p-0"> 
-                    <pre class="font-mono whitespace-pre-wrap">${rawOutput}</pre>
-                </div>
-                
-                <div class="mt-5 flex flex-col sm:flex-row gap-4">
-                    <button class="btn-primary-custom px-4 py-3 text-base font-bold rounded-lg flex-1" 
-                            onclick="window.analyzeSecurityRisk(currentMockScanData)">
-                        <i class="fas fa-brain mr-2"></i>✨ Analyze Risk & Mitigation (Mock AI)
-                    </button>
-                    <button class="px-4 py-3 text-base font-bold rounded-lg border-2 border-border-light dark:border-border-dark text-text-dark dark:text-text-light hover:border-primary-btn transition flex-1" 
-                            onclick="window.location.reload()">
-                        Start New Scan
-                    </button>
-                </div>
-
-                <div id="aiAnalysisReport" class="ai-analysis-container mt-6">
-                    <p class="text-gray-500 dark:text-text-light">Click "Analyze Risk & Mitigation (Mock AI)" to generate a custom security report.</p>
-                </div>
-            `;
-        }
-
-        function showErrorUI(targetValue, errorMessage) {
-            mockResult.innerHTML = `
-                <p class="summary bg-danger-alert text-bg-light mb-4">Scan failed for ${targetValue}!</p>
-                <div class="text-sm border border-danger-alert rounded-lg overflow-x-auto p-4 bg-gray-50 dark:bg-card-dark text-text-dark dark:text-text-light">
-                    <pre class="font-mono whitespace-pre-wrap">ERROR: ${errorMessage}</pre>
-                </div>
-                <button class="btn-primary-custom px-4 py-3 text-base font-bold rounded-lg mt-5" 
-                        onclick="window.location.reload()">
-                    Try New Scan
-                </button>
-            `;
-            mockResult.style.display = 'block';
-        }
-        
-        // --- Gemini API Call Logic (REPLACED WITH MOCK) ---
-        const analyzeSecurityRisk = async (scanData) => {
-            const analysisContainer = document.getElementById('aiAnalysisReport');
-            
-            // Show loading spinner
-            analysisContainer.innerHTML = `
-                <div class="flex items-center justify-center space-x-2 text-primary-btn">
-                    <i class="fas fa-spinner fa-spin"></i>
-                    <span>Analyzing risks (Mock AI)...</span>
-                </div>
-            `;
-            
-            // HARDCODED MOCK ANALYSIS
-            const mockAnalysisMarkdown = `
-## AI Risk Analysis & Mitigation Plan
-
-### Risk Assessment
-
-* **Risk Level: MODERATE to HIGH** - The final determination depends on the specific services running on the detected open ports (e.g., 22, 80, 443). Open ports represent the primary attack surface.
-* **Vulnerability Focus:** The risk is concentrated in the versions of the application software hosting these services. An unpatched web server or SSH daemon is a direct exploitation vector.
-* **Data Exposure:** Services handling data (like web servers) require strict security headers and access controls to prevent data leakage and enumeration attacks.
-
-### Mitigation Plan
-
-* **1. Immediate Service Verification:** Check the specific service version and vendor for every open port identified in the scan report. Cross-reference these versions against public vulnerability databases (e.g., CVE).
-* **2. Harden Access Control:** For administrative ports like SSH (22), disable password login and enforce key-based authentication. For web ports (80/443), ensure strong WAF/DDoS protection is in place.
-* **3. Disable Unnecessary Ports:** Any port found open that does not explicitly serve a business function must be immediately firewalled or disabled within the application. Adopt a "deny-by-default" security posture.
-`;
-            
-            // Simulate network delay for a better UX (2 seconds)
-            await new Promise(r => setTimeout(r, 2000));
-            
-            let resultText = mockAnalysisMarkdown;
-
-            // Convert Mock Markdown to HTML for display
-            let htmlContent = resultText
-                .replace(/^## (.*$)/gim, '<h3 class="ai-analysis-title text-2xl font-bold">$1</h3>')
-                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-                .replace(/\n\*/g, '<p class="pl-4 dark:text-text-light"><i class="fas fa-arrow-right text-secondary-btn mr-2"></i>') // Added dark text class here
-                .replace(/([^*]+$)/gm, '$1</p>');
-            
-            htmlContent = htmlContent.replace(/\*/g, '').replace(/(\/p>)\s*(\/p>)/g, '$1');
-
-            analysisContainer.innerHTML = htmlContent;
-        };
-        window.analyzeSecurityRisk = analyzeSecurityRisk;
-
-
-        // --- Tab Switching Logic ---
-        function activateTab(mode) {
-            scanMode = mode;
-            tabDefault.classList.remove('active', 'text-gray-600', 'hover:bg-bg-light');
-            tabCustom.classList.remove('active', 'text-gray-600', 'hover:bg-bg-light');
-            
-            if (mode === "default") {
-                tabDefault.classList.add("active");
-                tabCustom.classList.add("text-gray-600", "hover:bg-bg-light");
-                customInputs.style.display = "none";
-                startPortEl.value = DEFAULT_START;
-                endPortEl.value = DEFAULT_END;
-            } else {
-                tabCustom.classList.add("active");
-                tabDefault.classList.add("text-gray-600", "hover:bg-bg-light");
-                customInputs.style.display = "block";
-            }
-        }
-        tabDefault.addEventListener("click", () => activateTab("default"));
-        tabCustom.addEventListener("click", () => activateTab("custom"));
-        activateTab('default'); // Initialize tab state
-
-
-        // --- Main Scan Submission ---
-        form.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const targetValue = (targetInput.value || "").trim();
-            showLoading(targetValue);
-            statusEl.textContent = "Submitting job...";
-            
-            const startBtn = document.getElementById('startBtn');
-            startBtn.disabled = true;
-            startBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Submitting...';
-            
-            const data = new FormData(form);
-            const payload = {};
-            payload.target = targetValue;
-            payload.concurrency = parseInt(data.get('concurrency') || "500", 10);
-
-            if (scanMode === "custom") {
-                payload.start = parseInt(startPortEl.value || DEFAULT_START, 10);
-                payload.end = parseInt(endPortEl.value || DEFAULT_END, 10);
-            } else {
-                payload.start = DEFAULT_START;
-                payload.end = DEFAULT_END;
-            }
-            payload.no_banner = noBannerEl.checked;
-
-            // Simple client-side validation based on Flask's limits
-            if (!payload.target || (payload.end - payload.start + 1) > 2000) {
-                showErrorUI(targetValue, !payload.target ? "Target is required." : "Port range too large (max 2000).");
-                statusEl.textContent = "Error";
-                startBtn.disabled = false;
-                startBtn.innerHTML = '<i class="fas fa-rocket mr-2"></i> Start Scan';
-                return;
-            }
-
-            try {
-                const res = await fetch(`${API_BASE_URL}scan`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(payload)
-                });
-                const json = await res.json();
-                
-                if (json.job_id) {
-                    statusEl.textContent = "Job submitted: " + json.job_id;
-                    poll(json.job_id, targetValue);
-                } else {
-                    showErrorUI(targetValue, json.error || JSON.stringify(json));
-                    statusEl.textContent = "Error";
-                }
-            } catch (err) {
-                showErrorUI(targetValue, "Error submitting job: " + err);
-                statusEl.textContent = "Error";
-            } finally {
-                startBtn.disabled = false;
-                startBtn.innerHTML = '<i class="fas fa-rocket mr-2"></i> Start Scan';
-            }
-        });
-
-        // --- Polling results ---
-        async function poll(job_id, targetValue) {
-            statusEl.textContent = "Polling job " + job_id + "...";
-            const startTs = Date.now();
-            const interval = 2000;
-            const maxTime = 15 * 60 * 1000; // 15 minutes max poll time
-
-            while (Date.now() - startTs < maxTime) {
-                try {
-                    const r = await fetch(`${API_BASE_URL}scan-status/${job_id}?format=txt`);
-                    const ct = r.headers.get("content-type") || "";
-                    
-                    if (ct.includes("text/plain")) {
-                        const txt = await r.text();
-                        
-                        // Success path
-                        currentMockScanData = txt;
-                        showResultsUI(targetValue, txt);
-                        statusEl.textContent = "✅ Scan Complete";
-                        return;
-                    }
-
-                    const j = await r.json();
-                    if (j.status === 'running') {
-                        // Display status update without wiping the loading animation
-                        statusEl.textContent = `Running... (submitted at ${new Date(j.created*1000).toLocaleTimeString()})`;
-                    } else if (j.status === 'error') {
-                        showErrorUI(targetValue, j.error || "Unknown Error");
-                        statusEl.textContent = "Error";
-                        return;
-                    }
-                } catch (err) {
-                    showErrorUI(targetValue, "Poll error: " + err);
-                    statusEl.textContent = "Poll error"; return;
-                }
-                
-                // Wait for the next poll interval
-                await new Promise(r => setTimeout(r, interval));
-            }
-
-            showErrorUI(targetValue, "Polling timed out after 15 minutes.");
-            statusEl.textContent = "Timed out";
-        }
     </script>
 </body>
 </html>
+
